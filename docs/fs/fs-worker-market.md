@@ -8,7 +8,7 @@ Authoritative references:
 - [ADR 0117 — Pulsar as source of truth](../adr/0117-market-streams-sourced-from-pulsar-cache.md)
 - [docs/ops/pulsar-setup.md](../ops/pulsar-setup.md)
 - [docs/ops/cloud-pulsar-walkthrough.md](../ops/cloud-pulsar-walkthrough.md) (quick-reference version of the local-dev half)
-- Tickets [#110](https://github.com/4coders-com-br/little-trader/issues/110), [#117](https://github.com/4coders-com-br/little-trader/issues/117), [#119](https://github.com/4coders-com-br/little-trader/issues/119), [#107](https://github.com/4coders-com-br/little-trader/issues/107)
+- Tickets [#110](https://github.com/4coders-com-br/little-trader/issues/110), [#117](https://github.com/4coders-com-br/little-trader/issues/117), [#119](https://github.com/4coders-com-br/little-trader/issues/119), [#107](https://github.com/4coders-com-br/little-trader/issues/107), [#112](https://github.com/4coders-com-br/little-trader/issues/112)
 
 ---
 
@@ -411,6 +411,89 @@ docker run --rm --network host apachepulsar/pulsar:2.11.4 \
   | grep msgInCounter
 # expected: ≥1000
 ```
+
+### 7.2 — Canonical 1m polling clock
+
+The **canonical clock** is 60,000 ms (1 minute). All services align to it:
+
+| Component | Role |
+|---|---|
+| `worker.clj` `price-poll-ms[:ohlcv-1h]` | Polls Deribit for the latest OHLCV bar every 1m |
+| `ohlcv_agg.clj` consumer loop | Flushes completed 1h buckets as they close (driven by incoming 1m bars) |
+| `history.clj` warm-cache TTL | Re-reads Pulsar every 5m (5× the canonical clock) |
+| Future UI clock | Counts down to next bar; syncs its visual tick to `canonical-poll-ms` |
+
+`markets/canonical-poll-ms` is the single source of truth — import it rather than hardcoding 60000.
+
+---
+
+### 7.3 — Live tick publisher (ASAP priority)
+
+The `tick-publisher` component runs alongside the polling worker. It opens a **Deribit WebSocket connection** and subscribes to `ticker.<instrument>.100ms` for every configured price market. Each notification is published to `market-data.<slug>.tick` immediately — bypassing the 1m clock entirely.
+
+**Topic format:** `persistent://public/default/market-data.btc.tick`
+
+**Message envelope:**
+```json
+{
+  "data": {
+    "time":           1713535200000,
+    "last_price":     64150.0,
+    "mark_price":     64151.5,
+    "index_price":    64148.0,
+    "best_bid":       64149.0,
+    "best_ask":       64152.0,
+    "bid_size":       2.5,
+    "ask_size":       1.8,
+    "open_interest":  5423187.0
+  },
+  "_fs": {
+    "version":   1,
+    "topic-id":  "market-data.btc.tick",
+    "priority":  "asap",
+    "source":    "deribit-ws",
+    "channel":   "ticker.BTC-PERPETUAL.100ms",
+    "timestamp": 1713535200012
+  }
+}
+```
+
+**Control:**
+
+```bash
+# Disable live ticks (REST-only mode, e.g. for cost or debugging):
+export FS_LIVE_TICKS=false
+
+# Re-enable (default):
+export FS_LIVE_TICKS=true
+```
+
+**Verify the tick topic is receiving data** (via tunnel from your workstation):
+
+```bash
+docker run --rm --network host apachepulsar/pulsar:2.11.4 \
+  bin/pulsar-admin --admin-url http://localhost:8081 \
+  topics stats persistent://public/default/market-data.btc.tick \
+  | grep -E 'msgInCounter|msgRateIn'
+# expected: msgRateIn > 0 (multiple updates per second while market is open)
+```
+
+**REPL probe:**
+
+```clojure
+(require '[com.little-trader.fast-streaming.tick-publisher :as tp])
+(tp/status)
+;; => {:running? true :markets ["btc" "eth" "btc-usdt" ...]}
+```
+
+**Intended consumers:**
+- Stop-loss / take-profit evaluators (subscribe to `market-data.*.tick` with `Latest` + `Shared`)
+- Live price overlay on the chart (WebSocket bridge can forward ticks to the browser)
+- Risk monitors and position P&L updaters
+
+These consumers should use `SubscriptionInitialPosition/Latest` so they only process live ticks, never historical replay.
+
+---
 
 ---
 
